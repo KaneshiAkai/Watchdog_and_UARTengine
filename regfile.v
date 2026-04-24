@@ -16,6 +16,8 @@ module regfile (
     output [31:0] tRST_ms,
     output [15:0] arm_delay_us,
 
+    output reg clr_fault_pulse,
+
     input core_last_kick_src,
     input core_wdo,
     input core_enout,
@@ -43,12 +45,17 @@ module regfile (
             tWD_reg <= 32'd1600;
             tRST_reg <= 32'd200;
             arm_delay_reg <= 16'd150;
+            clr_fault_pulse <= 1'b0;
         end
         else begin
+            clr_fault_pulse <= 1'b0;
             if (reg_wr_en) begin
                 case (reg_addr) 
                     8'h00: begin
                         ctrl_reg[1:0] <= reg_wdata[1:0];
+                        if (reg_wdata[2] == 1'b1) begin
+                            clr_fault_pulse <= 1'b1;
+                        end
                     end
                     8'h04: begin
                         tWD_reg <= reg_wdata;

@@ -18,6 +18,13 @@ module receiver(
     reg [3:0] index = 0;
     reg [7:0] temp_reg = 8'd0;
 
+    reg rx_reg1, rx_reg2;
+    always @(posedge clk) begin
+        rx_reg1 <= rx;
+        rx_reg2 <= rx_reg1;
+    end
+    // Sử dụng rx_reg2 cho toàn bộ logic thay vì rx trực tiếp
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rdy <= 1'b0;
@@ -31,7 +38,7 @@ module receiver(
                             rdy <= 1'b0;      // clear rdy when busy
                         end
 
-                        if (rx == 0 || sample != 5'd0) begin
+                        if (rx_reg2 == 0 || sample != 5'd0) begin
                             sample <= sample + 5'd1;
                         end
 
@@ -51,7 +58,7 @@ module receiver(
                             sample <= sample + 5'd1;            // Cách này sẽ tiết kiệm được 1 bit memory cho sample
                         end
                         if (sample == 5'd8) begin
-                            temp_reg[index] <= rx;
+                            temp_reg[index] <= rx_reg2;
                             index <= index + 4'd1;
                         end
                         if (index == 4'd8 && sample == 5'd15) begin

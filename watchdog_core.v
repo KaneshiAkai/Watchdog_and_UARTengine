@@ -15,6 +15,8 @@ module watchdog_core (
     input [31:0] tRST_ms,
     input [15:0] arm_delay_us,
 
+    input clr_fault_pulse,
+
     output reg wdo,
     output reg en_o,
     output reg FaultActive,
@@ -43,44 +45,58 @@ module watchdog_core (
             en_o <= (wdi_src) ? en_sw : en_button;
             if (!en_o) begin
                 en_effective <= en_o;
+                delay_cnt <= 32'd0;
+                tWD_cnt <= 32'd0;
+                tRST_cnt <= 32'd0;
                 wdo <= 1'b1;
                 FaultActive <= 1'b0;
+                wdi <= 1'b1;
             end 
-
-            if (delay_cnt <= arm_delay_us) begin    // arm_delay
-                if (tick_us) begin
-                    delay_cnt <= delay_cnt + 1;
-                    tRST_cnt <= 1'b0; 
-                    tWD_cnt <= 1'b0;
-                    wdo <= 1'b1;
-                end
-            end
             else begin
-                en_effective <= en_o;
-                wdi <= (wdi_src) ? wdi_sw : wdi_button;
-                if (tick_ms) begin
-                    tWD_cnt <= tWD_cnt + 1;
-                end
-
-                if (tRST_cnt >= tRST_ms) begin  // after Fault -> arm_delay
-                    wdo <= 1'b0;
-                    delay_cnt <= 1'b0;
-                end
-                
-                if (tWD_cnt >= tWD_ms) begin    // Fault condition
-                    if (tick_ms) begin
-                        wdo <= 1'b0;
-                        tRST_cnt <= tRST_cnt + 1;
-                        FaultActive <= 1'b1;
+                if (delay_cnt <= arm_delay_us) begin    // arm_delay
+                    if (tick_us) begin
+                        delay_cnt <= delay_cnt + 1;
+                        tRST_cnt <= 1'b0; 
+                        tWD_cnt <= 1'b0;
+                        wdo <= 1'b1;
                     end
                 end
-                else if (!wdi) begin                 // Kick condition
-                    tWD_cnt <= 1'b0;
-                    if (wdi_src) begin
-                        last_kick_src <= 1'b1;
+                else begin
+                    en_effective <= en_o;
+                    wdi <= (wdi_src) ? wdi_sw : wdi_button;
+                    if (clr_fault_pulse && FaultActive) begin
+                        wdo <= 1'b1;              // Giải phóng WDO ngay lập tức
+                        FaultActive <= 1'b0;      // Xóa cờ lỗi
+                        tRST_cnt <= 32'd0;
+                        tWD_cnt <= 32'd0;
+                        delay_cnt <= 32'd0;       // Đưa FSM về lại trạng thái chờ arm_delay an toàn
                     end
                     else begin
-                        last_kick_src <= 1'b0;
+                        if (tick_ms) begin
+                            tWD_cnt <= tWD_cnt + 1;
+                        end
+
+                        if (tRST_cnt >= tRST_ms) begin  // after Fault -> arm_delay
+                            wdo <= 1'b1;
+                            delay_cnt <= 1'b0;
+                            FaultActive <= 1'b0;
+                        end
+                        else if (tWD_cnt >= tWD_ms) begin    // Fault condition
+                            if (tick_ms) begin
+                                wdo <= 1'b0;
+                                tRST_cnt <= tRST_cnt + 1;
+                                FaultActive <= 1'b1;
+                            end
+                        end
+                        else if (!wdi) begin                 // Kick condition
+                            tWD_cnt <= 1'b0;
+                            if (wdi_src) begin
+                                last_kick_src <= 1'b1;
+                            end
+                            else begin
+                                last_kick_src <= 1'b0;
+                            end
+                        end
                     end
                 end
             end

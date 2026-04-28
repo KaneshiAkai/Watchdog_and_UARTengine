@@ -156,7 +156,7 @@ The `watchdog_core` module implements a state-based watchdog with the following 
 
 **State Timing:**
 
-![FSM State Diagram](fsm_diagram.png)
+![FSM State Diagram](src/fsm_diagram.png)
 
 1. **DISABLED:** When EN=0 or at reset
    - All timers stopped

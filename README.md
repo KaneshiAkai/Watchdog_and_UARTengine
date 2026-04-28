@@ -1,11 +1,8 @@
 # Watchdog Monitor (TPS3431-like) + UART Configuration
 
-**FPGA Extended Contest 2026 - Preliminary Round RTL Design Test**
-
 **Platform:** Kiwi 1P5 Board (Gowin GW1N-UV1P5)  
 **Version:** v1.2  
 **Date:** 2026-02-24  
-**Author:** OneKiwi Technology
 
 ---
 

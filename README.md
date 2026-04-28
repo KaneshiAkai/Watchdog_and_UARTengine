@@ -1,9 +1,6 @@
 # Watchdog Monitor (TPS3431-like) + UART Configuration
 
 **Platform:** Kiwi 1P5 Board (Gowin GW1N-UV1P5)  
-**Version:** v1.2  
-**Date:** 2026-02-24  
-
 ---
 
 ## Table of Contents
@@ -989,6 +986,3 @@ This section maps the implementation features to the contest scoring criteria.
 - Gowin GW1N-1P5 Device Datasheet
 
 ---
-
-**Document Version:** v1.2  
-**Last Updated:** 2026-02-24  

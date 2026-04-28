@@ -158,40 +158,6 @@ The `watchdog_core` module implements a state-based watchdog with the following 
 
 ![FSM State Diagram](src/fsm_diagram.png)
 
-1. **DISABLED:** When EN=0 or at reset
-   - All timers stopped
-   - WDO = 1 (released)
-   - ENOUT = 0
-   - WDI input ignored
-
-2. **ARM_DELAY:** When EN transitions to 1
-   - Counts from 0 to arm_delay_us
-   - WDI falling edges are IGNORED during this period
-   - Protection against initialization glitches
-   - After arm_delay_us elapses → transition to MONITOR state
-
-3. **MONITOR/ARMED:** Normal watchdog operation
-   - tWD_cnt increments each millisecond (when tick_ms is asserted)
-   - WDI falling edges RESET tWD_cnt to 0
-   - ENOUT = 1 (watchdog is active and monitoring)
-   - If tWD_cnt ≥ tWD_ms without a kick → FAULT state
-   - If EN = 0 → DISABLED state
-
-4. **FAULT/RST_HOLD:** After timeout detected
-   - WDO = 0 (pulled low, LED on)
-   - FaultActive flag = 1
-   - tRST_cnt increments each millisecond
-   - WDI kicks are IGNORED during fault hold
-   - After tRST_cnt ≥ tRST_ms:
-     - WDO = 1 (released)
-     - FaultActive flag = 0
-     - Return to ARM_DELAY (safe restart)
-
-**Last Kick Source Tracking:**
-- The `last_kick_src` signal indicates whether the most recent valid kick came from:
-  - `0` = Hardware button (S1 / button input)
-  - `1` = Software command (UART KICK command)
-- Available in STATUS register (bit[4])
 
 ### Clock and Timing
 

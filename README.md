@@ -113,7 +113,7 @@ This section describes the core watchdog behavior as per the TPS3431-like specif
     - A new watchdog cycle begins
     - System must receive a new kick within tWD_ms or another fault occurs
 
-**Optional CLR_FAULT Feature:**
+**CLR_FAULT Feature:**
 - Writing bit[2]=1 to CTRL register (0x00) generates a `clr_fault_pulse`
 - If active, this immediately releases WDO and clears the fault condition
 - Watchdog immediately returns to the arm_delay state after fault is cleared
@@ -180,7 +180,7 @@ The `receiver.v` module implements a standard 8N1 UART receiver:
 - **Start Bit Detection:** Detects falling edge on RX line
 - **Data Bits:** Samples 8 data bits using 16x oversampling (middle-sample strategy)
 - **Stop Bit:** Validates stop bit presence
-- **Framing Error Detection:** (Optional, basic validation)
+- **Framing Error Detection:**
 - **Output:** `rx_rdy` flag + 8-bit `data_out` after successful reception
 
 **Baud Rate:** 115200 bits/second (standard serial communication rate)

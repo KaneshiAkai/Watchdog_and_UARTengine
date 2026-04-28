@@ -137,7 +137,7 @@ This section describes the core watchdog behavior as per the TPS3431-like specif
   - Driven to logic 0 (low voltage) when EN=0 or during arm_delay → LED turns OFF
   - Active-high convention: LED D4 is lit when watchdog is armed and ready
 
-**Rationale:** This simplified approach avoids requiring tri-state (inout) pins, which may be limited on the Gowin FPGA. The active-low/active-high conventions are clearly visible through LED behavior.
+**Rationale:** The active-low/active-high conventions are clearly visible through LED behavior.
 
 ---
 

@@ -995,4 +995,3 @@ This section maps the implementation features to the contest scoring criteria.
 
 **Document Version:** v1.2  
 **Last Updated:** 2026-02-24  
-**Author:** OneKiwi Technology / FPGA Contest Team

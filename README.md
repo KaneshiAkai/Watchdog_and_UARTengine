@@ -1,988 +1,343 @@
 # Watchdog Monitor (TPS3431-like) + UART Configuration
+## FPGA Extended Contest 2026 — Preliminary Round
 
+**Team:** Utopia_EDABK  
+**Authors:** Luong Xuan Thanh, Truong Dan Huy, Vu Thanh Hung, Le Viet Huy  
+**Affiliation:** School of Electrical and Electronic Engineering, Hanoi University of Science and Technology (HUST)  
 **Platform:** Kiwi 1P5 Board (Gowin GW1N-UV1P5)  
+**HDL:** Verilog 
+**System Clock:** 27 MHz
+
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [System Architecture](#system-architecture)
-3. [Functional Specification](#functional-specification)
-4. [Implementation Details](#implementation-details)
-5. [Pin Mapping & Resources](#pin-mapping--resources)
-6. [LED Display Convention](#led-display-convention)
-7. [UART Protocol & Register Map](#uart-protocol--register-map)
-8. [Build Instructions](#build-instructions)
-9. [How to Run the Demo on Kiwi 1P5 Board](#how-to-run-the-demo-on-kiwi-1p5-board)
-10. [Testbench Coverage](#testbench-coverage)
-11. [Scoring Criteria Mapping](#scoring-criteria-mapping)
+1. [Project Overview](#1-project-overview)
+2. [Repository Structure](#2-repository-structure)
+3. [Architecture & Module Descriptions](#3-architecture--module-descriptions)
+4. [Open-Drain Emulation on FPGA](#4-open-drain-emulation-on-fpga)
+5. [Register Map](#5-register-map)
+6. [UART Communication Protocol](#6-uart-communication-protocol)
+7. [CLR_FAULT Feature](#7-clr_fault-feature)
+8. [Pin Assignments & Constraints](#8-pin-assignments--constraints)
+9. [LED Display Convention](#9-led-display-convention)
+10. [How to Build](#10-how-to-build)
+11. [How to Run the Demo on Board](#11-how-to-run-the-demo-on-board)
 
 ---
 
-## Overview
+## 1. Project Overview
 
-This project implements an FPGA-based watchdog supervisor function that emulates the behavior of the Texas Instruments TPS3431 watchdog timer IC. The design runs on the Kiwi 1P5 FPGA board (Gowin GW1N-UV1P5) and allows runtime configuration of watchdog parameters via UART from a host PC.
+This design emulates the hardware watchdog supervisor function of the Texas Instruments TPS3431 IC. The system monitors a kick signal (WDI) and asserts a fault output (WDO, active-low) if no kick event is received within the configured timeout window (tWD). All timing parameters — tWD, tRST, and arm_delay — can be reconfigured at runtime via a UART interface using a frame-based protocol.
 
-### Key Features
+Default parameters after reset:
 
-- **Watchdog Timeout Monitoring:** Detects missing "kick" signals (WDI falling edge) and asserts a fault output (WDO) when timeout occurs
-- **Configurable Timing Parameters:** Runtime adjustment of tWD (watchdog timeout), tRST (fault hold time), and arm_delay_us via UART commands
-- **Enable/Disable Control:** Safe startup with arm_delay window to prevent spurious kicks during initialization
-- **UART Configuration:** Frame-based protocol with XOR checksum for reliable parameter read/write operations
-- **Hardware Demo:** Physical buttons and LEDs on the Kiwi 1P5 board for visual demonstration
-- **Comprehensive Register File:** Status monitoring and parameter storage with full R/W access
-
----
-
-## System Architecture
-
-The design is composed of modular blocks that work together to implement the watchdog functionality:
-
-**Top-Level Module (wd_top_module)** contains:
-- Clock Dividers: Generate microsecond and millisecond timing signals (tick_us, tick_ms) from the 27 MHz base clock
-- Button & Debounce: Synchronizer and debounce module for S1 (WDI) and S2 (EN) inputs, with falling edge detection
-- UART RX/TX Interface: Receiver and transmitter modules implementing 115200 bps 8N1 communication
-- Frame Parser & UART Engine: Decodes incoming UART frames, validates checksums, executes commands, and generates response frames
-- Register File (CTRL, tWD, tRST, arm_delay): Stores and manages watchdog configuration parameters
-- Watchdog Core FSM + Timers: Main watchdog state machine with timeout detection and fault generation
-- Status Generation: Reads current watchdog state (EN_EFFECTIVE, FAULT_ACTIVE, ENOUT, WDO, LAST_KICK_SRC)
-- Output Drivers: WDO (Pin 27 / LED D3) and ENOUT (Pin 28 / LED D4)
-
-### Module Descriptions
-
-| Module | Description |
-|--------|-------------|
-| `frequency_divider` | Generates clock enables for microsecond and millisecond timing (from 27 MHz base clock) |
-| `baudrate_gen` | Generates RX/TX enable signals for 115200 bps UART communication |
-| `receiver` | UART receiver with start/stop bit detection and 8N1 framing |
-| `transmitter` | UART transmitter implementing 8N1 framing |
-| `synchronizer_debounce_fallingedge` | Synchronizes button inputs (S1, S2), applies 20ms debounce, and detects falling edges |
-| `frame_parser` | Decodes incoming UART frames, validates checksums, executes commands, and generates response frames |
-| `regfile` | Stores and manages CTRL, tWD_ms, tRST_ms, arm_delay_us parameters; generates STATUS register |
-| `watchdog_core` | Implements the main watchdog FSM with timeout detection and fault generation |
-| `internal_rst` | Generates power-on reset signal synchronized to system clock |
-| `wd_top_module` | Top-level instantiation of all modules with signal routing |
+| Parameter     | Default Value | Description                              |
+|---------------|---------------|------------------------------------------|
+| tWD_ms        | 1600 ms       | Watchdog timeout (emulates CWD=NC mode)  |
+| tRST_ms       | 200 ms        | WDO hold time during fault               |
+| arm_delay_us  | 150 µs        | WDI ignore window after enabling         |
 
 ---
 
-## Functional Specification
+## 2. Repository Structure
 
-This section describes the core watchdog behavior as per the TPS3431-like specification.
-
-### 4.1 Enable/Disable and ENOUT
-
-**Requirement:** After system reset, the watchdog is in **disabled state** (safe state).
-
-**Behavior:**
-- **EN = 0 (Disabled):**
-  - WDI input is ignored; no internal kicks are processed
-  - ENOUT = 0 (watchdog not active)
-  - WDO is released to high-Z/pull-up (no fault)
-  - The watchdog is in a safe, idle state
-
-- **EN transitions 0→1 (Enable):**
-  - System starts counting the `arm_delay_us` window
-  - **During arm_delay window:** All WDI falling edge kicks are IGNORED (prevents spurious resets during initialization)
-  - After `arm_delay_us` expires:
-    - ENOUT becomes 1 (system is allowed to run)
-    - Watchdog timer (tWD) begins counting
-
-**Default arm_delay:** 150 microseconds
-
-### 4.2 Watchdog Kick and Timeout
-
-**Requirement:** Watchdog monitors the WDI (Watchdog Input) signal for falling edge events.
-
-**Kick Detection:**
-- A valid kick is a **falling edge** of the WDI signal
-- Kicks can originate from **button S1** or **software command** via UART (controlled by WDI_SRC bit in CTRL register)
-- Each valid kick **resets tWD_cnt to 0** and restarts the watchdog timeout countdown
-
-**Timeout Condition:**
-- If **tWD_cnt ≥ tWD_ms** before any new kick is received:
-  - WDO is asserted (pulled low / active-low convention) = **fault condition**
-  - WDO is held low for **tRST_ms** milliseconds
-  - After tRST_ms expires:
-    - WDO is released back to high/pull-up
-    - A new watchdog cycle begins
-    - System must receive a new kick within tWD_ms or another fault occurs
-
-**CLR_FAULT Feature:**
-- Writing bit[2]=1 to CTRL register (0x00) generates a `clr_fault_pulse`
-- If active, this immediately releases WDO and clears the fault condition
-- Watchdog immediately returns to the arm_delay state after fault is cleared
-
-**Default Parameters:**
-- `tWD_ms` = 1600 ms (emulates CWD=NC mode on TPS3431)
-- `tRST_ms` = 200 ms (WDO hold time during fault)
-
-### 4.3 Open-Drain Emulation
-
-**Implementation Approach:** This design uses **push-pull outputs with active-low convention** (Option B from specification).
-
-**Output Behavior:**
-- **WDO (Pin 27):**
-  - Driven to logic 0 (low voltage) during fault condition → LED turns ON
-  - Driven to logic 1 (high voltage) during normal operation → LED turns OFF
-  - Active-low convention: LED D3 is lit when fault is active
-
-- **ENOUT (Pin 28):**
-  - Driven to logic 1 (high voltage) after EN=1 and arm_delay expires → LED turns ON
-  - Driven to logic 0 (low voltage) when EN=0 or during arm_delay → LED turns OFF
-  - Active-high convention: LED D4 is lit when watchdog is armed and ready
-
-**Rationale:** The active-low/active-high conventions are clearly visible through LED behavior.
+```
+.
+├── wd_top_module.v         # Top-level structural module
+├── watchdog_core.v         # Watchdog FSM + timing logic
+├── regfile.v               # Configuration register file
+├── frame_parser.v          # UART frame decoder and command executor
+├── baudrate_gen.v          # Baud rate clock enable generator (115200 bps, 16x oversampling)
+├── receiver.v              # UART receiver (8N1, 16x oversampled)
+├── transmitter.v           # UART transmitter (8N1)
+├── synchronizer.v          # 2-FF synchronizer + debounce + edge detection for S1/S2
+├── frequency_divider.v     # Parameterized tick generator (produces tick_us and tick_ms)
+├── internal_rst.v          # Power-on reset generator (active after 65536 clock cycles)
+└── README.md
+```
 
 ---
 
-## Implementation Details
+## 3. Architecture & Module Descriptions
 
-### Watchdog Core FSM
+The design follows a strictly synchronous, single-clock (27 MHz) architecture. All sub-modules share the same clock and a globally distributed active-high reset signal (`rst_n`) generated internally by `internal_rst`.
 
-The `watchdog_core` module implements a state-based watchdog with the following state transitions:
+### 3.1 wd_top_module (Top Level)
 
-**State Transitions:**
-- **DISABLED (EN=0):** Entry point at reset and when EN is disabled. All timers stopped, WDO released, ENOUT = 0, WDI ignored.
-- **ARM_DELAY (EN transitions 0→1):** Counts from 0 to arm_delay_us. WDI falling edges IGNORED during this period for initialization protection. After arm_delay_us elapses, transitions to MONITOR state.
-- **MONITOR/ARMED:** Normal watchdog operation. tWD_cnt increments each millisecond. WDI falling edges RESET tWD_cnt to 0. ENOUT = 1. If tWD_cnt ≥ tWD_ms without kicks, transitions to FAULT state. If EN = 0, transitions to DISABLED state.
-- **FAULT/RST_HOLD:** Timeout detected. WDO = 0 (pulled low). tRST_cnt increments each millisecond. WDI kicks IGNORED during fault hold. After tRST_cnt ≥ tRST_ms, WDO released and returns to ARM_DELAY safe restart.
-- **CLR_FAULT:** If CLR_FAULT_PULSE received during FAULT state, immediately releases WDO and returns to ARM_DELAY.
+Structural top-level that instantiates and interconnects all sub-modules. It exposes only five external ports: `clk`, `B_s1` (WDI button), `B_s2` (EN button), `uart_rx`, and `uart_tx`, plus two output signals `wdo` and `en_o`.
 
-**State Timing:**
+### 3.2 watchdog_core
 
-![FSM State Diagram](src/fsm_diagram.png)
+Implements the core watchdog behavior using a synchronous always block with nested conditional logic (equivalent to the following states: RESET, ENABLE, TRANSITION/arm_delay, WAITING, KICK, FAULT, FAULT_EXPIRED, CLEAR_FAULT).
 
+Behavior summary:
+- On reset: watchdog is disabled, `wdo=1` (released), `en_o=0`, `FaultActive=0`.
+- When `EN=0`: all counters are cleared, `wdo=1`, `FaultActive=0`.
+- On `EN` 0→1 transition: the arm_delay counter begins. During this window, the WDI signal is ignored. `wdo=1` is held throughout.
+- After arm_delay_us microseconds: `en_effective` is asserted, and the tWD counter starts incrementing on every millisecond tick.
+- A valid kick (WDI falling edge, either from button or software) resets the tWD counter to zero.
+- If `tWD_cnt >= tWD_ms`: `wdo` is pulled low, `FaultActive` is set, and the tRST counter begins.
+- After `tRST_cnt >= tRST_ms`: `wdo` is released, `delay_cnt` is reset, and the system re-enters the arm_delay state to begin a new watchdog cycle.
+- If `clr_fault_pulse` is asserted while `FaultActive=1`: WDO is immediately released, all counters are cleared, and the FSM re-enters arm_delay.
 
-### Clock and Timing
+The WDI source is selected by `wdi_src` (CTRL register bit[1]): `0` selects the hardware button (wdi_button), `1` selects the software kick signal (wdi_sw, which is the logical inverse of kick_sw from regfile).
 
-The design uses a **27 MHz main clock** from the Kiwi 1P5 board. Timing-critical operations are driven by derived clock enables:
+The EN source follows the same selection: when `wdi_src=0`, EN is driven by the physical button toggle (en_button); when `wdi_src=1`, EN is driven by CTRL register bit[0] (en_sw).
 
-| Signal | Frequency | Purpose |
-|--------|-----------|---------|
-| `clk` (input) | 27 MHz | Main system clock |
-| `tick_us` | 1 MHz | Microsecond-precision timing (for arm_delay counting) |
-| `tick_ms` | 1 kHz | Millisecond-precision timing (for tWD and tRST counting) |
-| `baud_rx_en` | ~16 × 115200 Hz = 1.8432 MHz | UART RX sampling clock (16x oversampling) |
-| `baud_tx_en` | 115200 Hz | UART TX bit clock |
+### 3.3 regfile
 
-**Clock dividers are implemented in `frequency_divider.v` using parametric counters** for precise frequency generation without accumulating rounding errors.
+Stores all configuration and status registers. On reset, defaults are loaded. Implements write-enable logic for registers 0x00–0x0C and provides a combinational read path for all addresses including 0x10 (STATUS). The `clr_fault_pulse` signal is generated as a single-cycle pulse when CTRL bit[2] is written as 1; it is automatically cleared on the next clock cycle.
 
-### UART Receiver
+### 3.4 frame_parser
 
-The `receiver.v` module implements a standard 8N1 UART receiver:
+Two independent always blocks handle RX parsing and TX response generation. The RX FSM waits for the 0x55 header byte, then captures CMD, ADDR, LEN, up to 4 DATA bytes, and CHK. An internal `calc_chk` register accumulates the XOR of all bytes from CMD through DATA. If the received CHK matches `calc_chk`, `frame_rdy` is pulsed for one clock cycle. The TX FSM then constructs and sends the response frame byte-by-byte, waiting for `tx_busy` to de-assert between each byte.
 
-- **Start Bit Detection:** Detects falling edge on RX line
-- **Data Bits:** Samples 8 data bits using 16x oversampling (middle-sample strategy)
-- **Stop Bit:** Validates stop bit presence
-- **Framing Error Detection:**
-- **Output:** `rx_rdy` flag + 8-bit `data_out` after successful reception
+### 3.5 baudrate_gen
 
-**Baud Rate:** 115200 bits/second (standard serial communication rate)
+Generates independent clock-enable pulses `rx_en` (16x baud rate = 1,843,200 Hz) and `tx_en` (1x baud rate = 115,200 Hz) from the 27 MHz system clock using integer division counters.
 
-### UART Transmitter
+### 3.6 receiver
 
-The `transmitter.v` module implements a standard 8N1 UART transmitter:
+A 3-state FSM (S_START, S_DATA, S_STOP) with 16x oversampling. Samples each data bit at the center of the bit period (sample count 8 of 0–15). Asserts `rdy` after a complete 8N1 frame is received.
 
-- **Start Bit:** Always transmits 0
-- **Data Bits:** Transmits 8 bits LSB-first
-- **Stop Bit:** Always transmits 1
-- **Busy Flag:** `tx_busy` indicates transmission in progress
-- **Output:** Single `tx` line (idle high, drives low during transmission)
+### 3.7 transmitter
 
-### Button Synchronization & Debounce
+A 4-state FSM (S_IDLE, S_START, S_DATA, S_STOP) that serializes 8-bit data into 8N1 UART frames on each `clk_en` (tx_en) pulse. `tx_busy` remains asserted from the start of transmission until the stop bit completes.
 
-The `synchronizer_debounce_fallingedge.v` module ensures clean button inputs:
+### 3.8 synchronizer_debounce_fallingedge
 
-1. **Synchronization (2 flip-flops):**
-   - Prevents metastability from asynchronous button inputs
-   - Removes clock domain crossing issues
+- S1 (WDI): passes through a 2-FF synchronizer, a 20 ms debounce counter, then a falling-edge detector. The output `wdi_button` is active-low: it is logic 0 for exactly one clock cycle when a valid falling edge is detected on S1.
+- S2 (EN): passes through the same 2-FF synchronizer and 20 ms debounce. On each debounced falling edge, `en_button` toggles its state. This means a single press of S2 enables the watchdog, and a second press disables it.
 
-2. **Debounce (20 milliseconds):**
-   - Waits for signal stability across 20 ms window
-   - Eliminates contact bounce noise from mechanical buttons
-   - Used for both S1 (WDI) and S2 (EN) inputs
+### 3.9 frequency_divider
 
-3. **Falling Edge Detection:**
-   - Compares synchronized/debounced signal with previous state
-   - Detects 1→0 transitions only
-   - Output: `1` when falling edge detected, `0` otherwise
+Parameterized module used twice in the top level:
+- Instance `microsecond`: `CLK_FREQ_DESTINATION_HZ = 1_000_000` → produces a 1-cycle-wide `tick_us` pulse every 27 clock cycles (1 µs period).
+- Instance `millisecond`: `CLK_FREQ_DESTINATION_HZ = 1_000` → produces a 1-cycle-wide `tick_ms` pulse every 27,000 clock cycles (1 ms period).
 
-### Frame Protocol & Checksum
+### 3.10 internal_rst
 
-The `frame_parser.v` module implements the contest-specified frame protocol:
-
-**Frame Structure:**
-```
-[SYNC][CMD][ADDR][LEN][DATA (0-4 bytes)][CHK]
-```
-
-| Field | Bytes | Value | Notes |
-|-------|-------|-------|-------|
-| SYNC | 1 | 0x55 | Synchronization marker (fixed) |
-| CMD | 1 | 0x01-0x04 | Command code (see below) |
-| ADDR | 1 | 0x00-0x10 | Register address |
-| LEN | 1 | 0, 2, 4 | Data length in bytes |
-| DATA | 0-4 | Variable | Register data (Big-Endian if multi-byte) |
-| CHK | 1 | Variable | XOR checksum of CMD^ADDR^LEN^DATA |
-
-**Checksum Calculation:**
-```
-CHK = CMD ⊕ ADDR ⊕ LEN ⊕ DATA[byte0] ⊕ DATA[byte1] ⊕ ... ⊕ DATA[byteN]
-```
-Where ⊕ is bitwise XOR. If LEN=0 (no data), only CMD^ADDR^LEN is checksummed.
-
-**Response Frame (ACK):**
-```
-[SYNC][CMD][ADDR][LEN][DATA][CHK]
-```
-The device echoes back the same structure with response data.
-
-### Register Map
-
-All registers are 32-bit unless otherwise noted. Write and read operations are performed via UART using WRITE_REG and READ_REG commands.
-
-| Address | Name | R/W | Width | Description |
-|---------|------|-----|-------|-------------|
-| 0x00 | CTRL | R/W | 32 | Control register: EN_SW (bit 0), WDI_SRC (bit 1), CLR_FAULT (bit 2, write-1-to-clear) |
-| 0x04 | tWD_ms | R/W | 32 | Watchdog timeout in milliseconds (default: 1600) |
-| 0x08 | tRST_ms | R/W | 32 | WDO hold time during fault in milliseconds (default: 200) |
-| 0x0C | arm_delay_us | R/W | 16 | Delay after EN transition 0→1, in microseconds (default: 150) |
-| 0x10 | STATUS | R | 32 | Status register (read-only): EN_EFFECTIVE (bit 0), FAULT_ACTIVE (bit 1), ENOUT (bit 2), WDO (bit 3), LAST_KICK_SRC (bit 4) |
-
-**CTRL Register (0x00) Details:**
-- **Bit[0] EN_SW:** Watchdog enable (1=enabled, 0=disabled)
-- **Bit[1] WDI_SRC:** Kick source selection
-  - 0 = Button S1 (hardware kick)
-  - 1 = Software KICK command (via UART)
-- **Bit[2] CLR_FAULT:** Clear fault flag (write-1-to-clear)
-  - Writing 1 immediately releases WDO and clears fault
-  - Automatically returns to arm_delay safe restart
-- **Bits[31:3]:** Reserved (reads as 0)
-
-**STATUS Register (0x10) Details (Read-Only):**
-- **Bit[0] EN_EFFECTIVE:** 1 when watchdog is armed and monitoring (after arm_delay has elapsed)
-- **Bit[1] FAULT_ACTIVE:** 1 when fault condition is active (WDO held low)
-- **Bit[2] ENOUT:** Mirror of ENOUT output pin (reflects watchdog armed state)
-- **Bit[3] WDO:** Mirror of WDO output pin (0=fault, 1=no fault)
-- **Bit[4] LAST_KICK_SRC:** Source of last valid kick (0=button, 1=software)
-- **Bits[31:5]:** Reserved (reads as 0)
+Holds `rst_n` low for exactly 65,536 clock cycles (~2.43 ms at 27 MHz) after FPGA power-on or configuration, then asserts `rst_n` high permanently. This ensures all flip-flops reach a known state before any logic becomes active.
 
 ---
 
-## Pin Mapping & Resources
+## 4. Open-Drain Emulation on FPGA
 
-The following resources on the Kiwi 1P5 board are used for the watchdog demonstration:
+**Chosen Approach: Option B — Push-pull output with active-low convention.**
 
-| Function | Board Resource | Net/IO (Pin #) | I/O Type | Notes |
-|----------|----------------|----------------|----------|-------|
-| System Clock | On-board 27 MHz | Pin 4 (clk) | Input (LVCMOS33) | Pulled high internally |
-| WDI (Kick Input) | Button S1 | Pin 35 (B_s1) | Input (LVCMOS33) | Active-low; mechanical debounce required |
-| EN (Enable) | Button S2 | Pin 36 (B_s2) | Input (LVCMOS33) | Active-low |
-| WDO (Fault Output) | LED D3 | Pin 27 (wdo) | Output (LVCMOS33) | Active-low: LED on when WDO=0 |
-| ENOUT (Armed Output) | LED D4 | Pin 28 (en_o) | Output (LVCMOS33) | Active-high: LED on when en_o=1 |
-| UART RX | USB-UART GWU2U | Pin 33 (uart_rx) | Input (LVCMOS33) | Pulled high (idle=1) |
-| UART TX | USB-UART GWU2U | Pin 34 (uart_tx) | Output (LVCMOS33) | Idle high (1) |
+- `wdo` output: logic 1 in normal/idle state (WDO released, equivalent to external pull-up), logic 0 when a fault is active (WDO pulled low). LED D3 is therefore ON when a fault is asserted (WDO=0).
+- `en_o` output: logic 0 when the watchdog is disabled or during arm_delay, logic 1 after arm_delay completes and the watchdog is actively monitoring. LED D4 is ON when ENOUT=1.
 
-**Pin Configuration File:** `watchdog.cst` contains the complete constraint definitions.
-
-**Timing Constraint File:** `watchdog.sdc` specifies the 27 MHz clock with a period of 37.037 ns.
+In a real open-drain application, the `wdo` signal would drive the gate of an external N-channel MOSFET or be connected to a tri-state buffer output enable. In this FPGA demo context, the LED illumination convention described in Section 9 directly reflects the active-low WDO behavior.
 
 ---
 
-## LED Display Convention
+## 5. Register Map
 
-This design uses the following LED indication scheme on the Kiwi 1P5 board:
+All registers are 32-bit wide and accessible at byte addresses. UART data is transmitted and received MSB-first within the 4-byte data field.
 
-### LED D3 (Fault Indicator / WDO Output) - Pin 27
+| Address | Name         | R/W | Width  | Description                                                                                   |
+|---------|--------------|-----|--------|-----------------------------------------------------------------------------------------------|
+| 0x00    | CTRL         | R/W | 32-bit | bit[0]: EN_SW (1=enable watchdog via software); bit[1]: WDI_SRC (0=button, 1=software); bit[2]: CLR_FAULT (write 1 to immediately release WDO) |
+| 0x04    | tWD_ms       | R/W | 32-bit | Watchdog timeout in milliseconds. Default: 1600.                                             |
+| 0x08    | tRST_ms      | R/W | 32-bit | WDO hold time during fault, in milliseconds. Default: 200.                                   |
+| 0x0C    | arm_delay_us | R/W | 16-bit | WDI ignore window after enable, in microseconds. Default: 150. (Upper 16 bits ignored on write, returned as 0 on read.) |
+| 0x10    | STATUS       | R   | 32-bit | bit[0]: EN_EFFECTIVE; bit[1]: FAULT_ACTIVE; bit[2]: ENOUT (=en_o); bit[3]: WDO (=wdo); bit[4]: LAST_KICK_SRC (0=button, 1=software) |
 
-| State | LED Status | Watchdog Condition |
-|-------|------------|--------------------|
-| ON (LED lit) | WDO = 0 | **FAULT STATE:** Timeout detected, WDO held low for tRST_ms |
-| OFF (LED dark) | WDO = 1 | **NORMAL STATE:** No fault, watchdog operating normally or disabled |
-
-**Interpretation:**
-- If LED D3 blinks with period ≈ (tWD + tRST), the watchdog is operating and timing out repeatedly (no kicks received).
-- If LED D3 stays ON, a fault has occurred and has not been cleared.
-- If LED D3 stays OFF, either the watchdog is disabled or operating normally with regular kicks.
-
-### LED D4 (Watchdog Armed Indicator / ENOUT Output) - Pin 28
-
-| State | LED Status | Watchdog Condition |
-|-------|------------|--------------------|
-| ON (LED lit) | ENOUT = 1 | **ARMED STATE:** Watchdog is enabled, past arm_delay window, and actively monitoring |
-| OFF (LED dark) | ENOUT = 0 | **DISARMED STATE:** Watchdog is disabled (EN=0) or still in arm_delay window |
-
-**Interpretation:**
-- Turn on button S2 (EN) → After ~150 µs, LED D4 should turn on (arm_delay expires)
-- While LED D4 is on, press button S1 (kick) → No immediate LED response (normal operation)
-- If no kicks are sent and tWD_ms elapses → LED D3 turns on (fault)
-- After tRST_ms, LED D3 turns off → New cycle restarts
+Notes:
+- Writing to address 0x10 (STATUS) has no effect; it is read-only.
+- The CLR_FAULT bit (CTRL bit[2]) is implemented as write-1-to-clear: the regfile generates a single-cycle `clr_fault_pulse` when this bit is written as 1, and it reads back as 0.
+- CTRL bit[1] (WDI_SRC) also controls the EN source: 0 = EN from Button S2 toggle, 1 = EN from CTRL bit[0].
 
 ---
 
-## UART Protocol & Register Map
+## 6. UART Communication Protocol
 
-### Minimum UART Commands
+**Settings:** 115200 bps, 8 data bits, no parity, 1 stop bit (8N1).
 
-The device must support the following UART commands via the frame protocol:
+### 6.1 Request Frame (Host → FPGA)
 
-#### 1. WRITE_REG (0x01)
-**Purpose:** Write a value to a configuration register.
-
-**Request Frame:**
 ```
-[0x55][0x01][ADDR][LEN][DATA][CHK]
+[0x55] [CMD] [ADDR] [LEN] [DATA byte 0] ... [DATA byte N-1] [CHK]
 ```
 
-**Response Frame:**
+- **Header:** Always `0x55`.
+- **CMD:** Command byte (see Section 6.3).
+- **ADDR:** Register address (e.g., `0x00`, `0x04`).
+- **LEN:** Number of DATA bytes that follow (0 for commands with no data payload).
+- **DATA:** Up to 4 bytes. For 32-bit register writes, send 4 bytes MSB first.
+- **CHK:** XOR of all bytes from CMD through the last DATA byte (inclusive).
+
+### 6.2 Response Frame (FPGA → Host)
+
 ```
-[0x55][0x01][ADDR][LEN][DATA][CHK]
+[0x55] [CMD | 0x80] [ADDR] [0x04] [DATA3] [DATA2] [DATA1] [DATA0] [CHK]
 ```
 
-**Example:** Write tWD_ms = 2000 ms to address 0x04
-```
-Request:  [55 01 04 04 00 00 07 D0 FC]
-          (SYNC)(CMD)(ADDR)(LEN)(DATA----)(CHK)
-          CHK = 01 ^ 04 ^ 04 ^ 00 ^ 00 ^ 07 ^ D0 = FC ✓
+- The response CMD byte has bit[7] set (`CMD | 0x80`) to distinguish it from a request.
+- The DATA field is always 4 bytes (the full 32-bit register value), sent MSB first.
+- CHK is the XOR of all bytes from `[CMD | 0x80]` through `[DATA0]`.
 
-Response: [55 01 04 04 00 00 07 D0 FC]
-          (Echo back with updated value)
-```
+### 6.3 Command Set
 
-#### 2. READ_REG (0x02)
-**Purpose:** Read the current value of a configuration register.
+| CMD  | Name        | LEN | Description                                                     |
+|------|-------------|-----|-----------------------------------------------------------------|
+| 0x01 | WRITE_REG   | 1–4 | Write register at ADDR with DATA. Use LEN=4 for 32-bit values. |
+| 0x02 | READ_REG    | 0   | Read register at ADDR. Returns the 32-bit register value.      |
+| 0x03 | KICK        | 0   | Generate one software kick event (equivalent to one WDI falling edge). ADDR is ignored. |
+| 0x04 | GET_STATUS  | 0   | Read STATUS register (equivalent to READ_REG with ADDR=0x10). ADDR field is ignored. |
 
-**Request Frame:**
-```
-[0x55][0x02][ADDR][00][CHK]
-```
-(LEN=0 for read operations)
+### 6.4 Frame Examples
 
-**Response Frame:**
+Enable watchdog via software (set CTRL = 0x00000001, WDI_SRC=0, EN_SW=1):
 ```
-[0x55][0x02][ADDR][LEN][DATA][CHK]
+TX: 55 01 00 04 00 00 00 01 CHK
+    CHK = 0x01 ^ 0x00 ^ 0x04 ^ 0x00 ^ 0x00 ^ 0x00 ^ 0x01 = 0x04
+TX: 55 01 00 04 00 00 00 01 04
 ```
 
-**Example:** Read tWD_ms from address 0x04
+Set tWD to 500 ms (ADDR=0x04, DATA=0x000001F4):
 ```
-Request:  [55 02 04 00 03]
-          (SYNC)(CMD)(ADDR)(LEN)(CHK)
-          CHK = 02 ^ 04 ^ 00 = 06
-
-Response: [55 02 04 04 00 00 07 D0 FC]
-          (SYNC)(CMD)(ADDR)(LEN=4)(DATA=2000)(CHK)
-          CHK = 02 ^ 04 ^ 04 ^ 00 ^ 00 ^ 07 ^ D0 = FC ✓
+TX: 55 01 04 04 00 00 01 F4 CHK
+    CHK = 0x01 ^ 0x04 ^ 0x04 ^ 0x00 ^ 0x00 ^ 0x01 ^ 0xF4 = 0xF4
+TX: 55 01 04 04 00 00 01 F4 F4
 ```
 
-#### 3. KICK (0x03)
-**Purpose:** Generate a software kick event (equivalent to WDI falling edge).
-
-**Request Frame:**
+Send a software kick (CMD=0x03):
 ```
-[0x55][0x03][ADDR][00][CHK]
-```
-(ADDR is typically 0x00, LEN=0)
-
-**Response Frame:**
-```
-[0x55][0x03][00][00][CHK]
+TX: 55 03 00 00 CHK
+    CHK = 0x03 ^ 0x00 ^ 0x00 = 0x03
+TX: 55 03 00 00 03
 ```
 
-**Example:** Send a software kick
+Read STATUS (CMD=0x04):
 ```
-Request:  [55 03 00 00 56]
-          (SYNC)(CMD)(ADDR=0)(LEN=0)(CHK=03^00^00=03)
-          
-Response: [55 03 00 00 56]
-          (ACK confirmation)
+TX: 55 04 00 00 CHK
+    CHK = 0x04 ^ 0x00 ^ 0x00 = 0x04
+TX: 55 04 00 00 04
 ```
-
-#### 4. GET_STATUS (0x04)
-**Purpose:** Read the STATUS register (0x10) for quick state inspection.
-
-**Request Frame:**
-```
-[0x55][0x04][10][00][CHK]
-```
-
-**Response Frame:**
-```
-[0x55][0x04][10][04][DATA (4 bytes)][CHK]
-```
-
-**Example:** Get status
-```
-Request:  [55 04 10 00 51]
-          CHK = 04 ^ 10 ^ 00 = 14 (NOT 51... recalculate)
-          Correct: CHK = 04 ^ 10 ^ 00 = 14
-          
-Response: [55 04 10 04 00 00 00 0F 19]
-          (SYNC)(CMD)(ADDR)(LEN=4)(STATUS=0x0F)(CHK)
-          STATUS bits: EN_EFF(1), FAULT(1), ENOUT(1), WDO(1) = 0x0F
-          CHK = 04 ^ 10 ^ 04 ^ 00 ^ 00 ^ 00 ^ 0F = 19 ✓
-```
-
-### Mandatory Register Map (Summary)
-
-| Address | Name | Type | Width | Default | Access | Description |
-|---------|------|------|-------|---------|--------|-------------|
-| 0x00 | CTRL | RW | 32 | 0x00 | Via WRITE/READ_REG | bit0=EN_SW, bit1=WDI_SRC, bit2=CLR_FAULT |
-| 0x04 | tWD_ms | RW | 32 | 1600 | Via WRITE/READ_REG | Watchdog timeout (ms) |
-| 0x08 | tRST_ms | RW | 32 | 200 | Via WRITE/READ_REG | WDO hold time (ms) |
-| 0x0C | arm_delay_us | RW | 16 | 150 | Via WRITE/READ_REG | Arm delay after enable (µs) |
-| 0x10 | STATUS | RO | 32 | Varies | Via GET_STATUS | Read-only status bits |
 
 ---
 
-## Build Instructions
+## 7. CLR_FAULT Feature
 
-### Prerequisites
+The CLR_FAULT mechanism allows the host to immediately terminate an active fault (WDO assertion) without waiting for the tRST timer to expire.
 
-- **Gowin EDA IDE** (v1.9.12 or later) - Download from Gowin Semiconductor official website
-- **Kiwi 1P5 Board & USB Cable** - For programming and UART communication
-- **PC/Laptop with Python or Terminal** - For UART communication testing
+**Implementation:** When the host writes `0x00000004` (or any value with bit[2]=1) to the CTRL register (address 0x00), the `regfile` generates a single-cycle `clr_fault_pulse` signal. The `watchdog_core` monitors this pulse: if `FaultActive=1` at the time the pulse arrives, it immediately sets `wdo=1`, clears `FaultActive`, resets all counters (`tRST_cnt`, `tWD_cnt`, `delay_cnt`), and re-enters the arm_delay phase to begin a fresh watchdog cycle.
 
-### Step 1: Set Up Project in Gowin EDA
+**Usage:** To use CLR_FAULT, send a WRITE_REG command to address 0x00 with bit[2] set. The bit is self-clearing and reads back as 0.
 
-1. **Create a New Project:**
-   - Open Gowin EDA
-   - File → New Project
-   - Select device: **GW1N-UV1P5** (QN48XC7/I6 package)
-   - Choose working directory
+```
+TX: 55 01 00 04 00 00 00 04 01
+```
 
-2. **Add Source Files:**
-   - Add all Verilog source files to the project:
-     - `wd_top_module.v` (top-level)
-     - `watchdog_core.v`
-     - `regfile.v`
-     - `frame_parser.v`
-     - `receiver.v`
-     - `transmitter.v`
-     - `synchronizer_debounce_fallingedge.v`
-     - `frequency_divider.v`
-     - `baudrate_gen.v`
-     - `internal_rst.v`
-
-3. **Set Top Module:**
-   - Right-click project → Properties
-   - HDL → Top Module: Select `wd_top_module`
-
-4. **Add Constraint Files:**
-   - Add `watchdog.cst` (physical pin mapping)
-   - Add `watchdog.sdc` (timing constraints)
-
-5. **Configure Build Settings:**
-   - Device: GW1N-1P5
-   - Package: QN48
-   - Grade: C
-   - Speed: I6
-
-### Step 2: Synthesize & Place & Route
-
-1. **Run Synthesis:**
-   - Tools → Synthesize
-   - Wait for completion (check Messages window for errors)
-
-2. **Run Place & Route (P&R):**
-   - Tools → Place & Route
-   - Monitor progress; ensure all constraints are satisfied
-
-3. **Verify Timing:**
-   - Open Timing Report (`watchdog.twr`)
-   - Check that all paths meet timing requirements (27 MHz = 37.037 ns period)
-
-4. **Generate Bitstream:**
-   - Tools → Generate Bitstream
-   - Output: `watchdog.fs` (FPGA bitstream file)
-
-### Step 3: Program the FPGA
-
-1. **Connect Kiwi 1P5 Board:**
-   - Connect USB cable from PC to the board's USB-UART connector
-   - LED should indicate power on
-
-2. **Program via Gowin EDA:**
-   - Click Device → Program (or use right-click context menu)
-   - Select generated bitstream (`watchdog.fs`)
-   - Click "Program"
-   - Wait for completion message
-
-3. **Alternative: Use GowinProgrammer:**
-   - Launch Gowin Programmer from Gowin EDA Tools menu
-   - Click Device → Detect
-   - Select GOWIN Device (should auto-detect USB connection)
-   - Load bitstream file
-   - Click "Program All"
-
-### Step 4: Verify Programming
-
-- Power cycle the board or press the reset button
-- The firmware should load automatically
-- Initial state: LED D3 (WDO) should be OFF, LED D4 (ENOUT) should be OFF
+Note: CLR_FAULT has no effect if the watchdog is not currently in a fault state (FaultActive=0).
 
 ---
 
-## How to Run the Demo on Kiwi 1P5 Board
+## 8. Pin Assignments & Constraints
+
+The following pin assignments apply to the Kiwi 1P5 board (Gowin GW1N-UV1P5). All signals use LVCMOS33 I/O standard.
+
+| Signal     | Board Resource | Net/IO         | Pin | Direction |
+|------------|----------------|----------------|-----|-----------|
+| clk        | 27 MHz OSC     | —              | 4   | Input     |
+| B_s1 (WDI) | Button S1      | IOR1B (KEY1)   | 35  | Input     |
+| B_s2 (EN)  | Button S2      | IOR1A (KEY2)   | 36  | Input     |
+| wdo        | LED D3         | IOR17A (LED1)  | 27  | Output    |
+| en_o       | LED D4         | IOR15B (LED2)  | 28  | Output    |
+| uart_rx    | USB-UART GWU2U | IOR11B         | 33  | Input     |
+| uart_tx    | USB-UART GWU2U | IOR11A         | 34  | Output    |
+
+Declare these assignments in the Gowin `.cst` (physical constraints) file.
+
+---
+
+## 9. LED Display Convention
+
+| LED        | Signal  | Logic 1 (LED ON)                              | Logic 0 (LED OFF)                            |
+|------------|---------|-----------------------------------------------|----------------------------------------------|
+| D4 (ENOUT) | en_o    | Watchdog is enabled and arm_delay has expired. The system is actively monitoring WDI. | Watchdog is disabled, or arm_delay is still counting. |
+| D3 (WDO)   | wdo     | No fault: WDO is released (pull-up equivalent). LED D3 is OFF in normal operation. | Fault is active: WDO is pulled low. LED D3 turns ON for tRST_ms milliseconds to indicate a watchdog timeout event. |
+
+Summary for the board demo:
+- Both LEDs OFF after reset: normal disabled state.
+- D4 turns ON after pressing S2 (EN) and waiting for arm_delay (~150 µs, not visible to the eye): watchdog is armed and running.
+- D3 turns ON briefly (200 ms default) if no kick is received within 1600 ms: fault/timeout event.
+- D3 turns OFF after tRST_ms, D4 stays ON, and a new watchdog cycle begins.
+- Pressing S1 while D4 is ON resets the watchdog counter and prevents D3 from turning ON.
+
+---
+
+## 10. How to Build
+
+### Requirements
+
+- Gowin EDA (GOWIN FPGA Designer), version supporting GW1N-UV1P5 device.
+- Target device: GW1N-UV1P5 (package as specified on the Kiwi 1P5 board).
+
+### Steps
+
+1. Open Gowin FPGA Designer and create a new project.
+2. Select device: GW1N-UV1P5 (refer to the Kiwi 1P5 documentation for the exact package code).
+3. Add all Verilog source files to the project:
+   - `wd_top_module.v` (set as top-level module)
+   - `watchdog_core.v`
+   - `regfile.v`
+   - `frame_parser.v`
+   - `baudrate_gen.v`
+   - `receiver.v`
+   - `transmitter.v`
+   - `synchronizer.v`
+   - `frequency_divider.v`
+   - `internal_rst.v`
+4. Add the physical constraints file (`.cst`) with the pin assignments listed in Section 8.
+5. Assign a 27MHz clock timing constraint to the 'clk' port using the `.sdc` file.
+6. Run Synthesis.
+7. Run Place & Route.
+8. Generate the bitstream.
+
+---
+
+## 11. How to Run the Demo on Board
 
 ### Hardware Setup
 
-1. **Power Connection:**
-   - USB cable provides power to the board
-   - Ensure board powers up after programming
+1. Connect the Kiwi 1P5 board to the PC via the USB-UART (GWU2U) interface.
+2. Program the board with the generated bitstream using the Gowin Programmer tool.
+3. Open a serial terminal (e.g., PuTTY, Tera Term, or a Python script) on the PC. Remember to install the GWU2U USB-UART driver via Zadig.
+   - Port: the COM port assigned to the GWU2U USB-UART adapter.
+   - Settings: 115200 baud, 8 data bits, no parity, 1 stop bit (8N1).
 
-2. **Button & LED Verification:**
-   - **S1 (Pin 35):** Designated for WDI kick input
-   - **S2 (Pin 36):** Designated for EN enable control
-   - **LED D3 (Pin 27):** Fault indicator (should be OFF initially)
-   - **LED D4 (Pin 28):** Watchdog armed indicator (should be OFF initially)
+### Demo Scenarios
 
-### Demo Scenario 1: Hardware Button Kick (No UART)
+**Scenario 1: Basic watchdog operation (hardware mode)**
 
-This scenario demonstrates basic watchdog operation using only the physical buttons.
+1. After programming, both LEDs are OFF (watchdog disabled, reset state).
+2. Press Button S2 once. After approximately 150 µs, LED D4 (ENOUT) turns ON — the watchdog is now armed.
+3. Periodically press Button S1 (within 1600 ms between presses) to kick the watchdog. LED D3 remains OFF.
+4. Stop pressing S1 and wait approximately 1600 ms. LED D3 (WDO) turns ON — fault is asserted.
+5. After 200 ms, LED D3 turns OFF automatically — fault period expired, watchdog restarts.
+6. Press S2 again to disable the watchdog. LED D4 turns OFF.
 
-**Procedure:**
+**Scenario 2: Software control via UART**
 
-1. **Initial State:**
-   - Power on the board
-   - Both LEDs OFF
+1. Send WRITE_REG to 0x00 with value `0x00000003` (EN_SW=1, WDI_SRC=1) to enable the watchdog in software mode.
+2. LED D4 turns ON after arm_delay.
+3. Periodically send the KICK command (`55 03 00 00 03`) to keep the watchdog alive.
+4. Stop sending KICK commands. After 1600 ms, LED D3 turns ON.
+5. To immediately clear the fault, send WRITE_REG to 0x00 with value `0x00000007` (EN_SW=1, WDI_SRC=1, CLR_FAULT=1): `55 01 00 04 00 00 00 07 02`. LED D3 turns OFF immediately.
 
-2. **Enable the Watchdog:**
-   - Press and hold **button S2** for ~1 second
-   - **Expected:** After release, LED D4 slowly turns on (arm_delay ≈ 150 µs, nearly instant)
-   - **Meaning:** Watchdog is now armed and monitoring
+**Scenario 3: Change tWD to 500 ms**
 
-3. **Send Periodic Kicks:**
-   - Press **button S1** every 500 ms (several times)
-   - **Expected:** LED D3 remains OFF (no fault)
-   - **Meaning:** Watchdog is receiving valid kicks
+1. Ensure WDI_SRC=1 (software mode).
+2. Send WRITE_REG to 0x04 with value `0x000001F4` (500 decimal): `55 01 04 04 00 00 01 F4 F4`.
+3. The watchdog will now time out after 500 ms without a kick instead of 1600 ms.
 
-4. **Stop Sending Kicks (Trigger Timeout):**
-   - Stop pressing button S1
-   - Wait for ~1600 ms (default tWD_ms)
-   - **Expected:** LED D3 suddenly turns ON
-   - **Meaning:** Watchdog timeout detected, fault activated, WDO asserted
+**Scenario 4: Read STATUS**
 
-5. **Fault Release:**
-   - Wait for ~200 ms (default tRST_ms)
-   - **Expected:** LED D3 turns OFF
-   - **Meaning:** Fault hold time expired, WDO released, watchdog returns to monitoring
+1. Send GET_STATUS: `55 04 00 00 04`.
+2. The FPGA responds with: `55 84 00 04 [DATA3] [DATA2] [DATA1] [DATA0] [CHK]`, where the 32-bit DATA field reflects the current STATUS register bits.
 
-6. **Disable the Watchdog:**
-   - Press and hold **button S2** again for ~1 second
-   - **Expected:** LED D4 turns OFF
-   - **Meaning:** Watchdog disabled, safe state
 
-### Demo Scenario 2: Software Kick via UART (PC Configuration)
-
-This scenario demonstrates UART configuration and software-generated kicks.
-
-**Required:** USB-to-UART terminal on PC (e.g., PuTTY, minicom, or custom Python script)
-
-**Procedure:**
-
-1. **Open UART Terminal:**
-   - Identify COM port of USB-UART (Device Manager on Windows, `dmesg` on Linux)
-   - Example: COM3 on Windows or `/dev/ttyUSB0` on Linux
-   - Settings: **115200 bps, 8 data bits, 1 stop bit, no parity (8N1)**
-
-2. **Enable Watchdog via UART:**
-   - Send WRITE_REG command to set CTRL[0]=1:
-     ```
-     Frame: [55 01 00 04 00 00 00 01 5F]
-     (Write 0x00000001 to address 0x00 to enable EN_SW)
-     ```
-   - Expected: Device echoes frame back
-   - LED D4 should turn on (watchdog armed)
-
-3. **Switch to Software Kick Mode:**
-   - Send WRITE_REG command to set CTRL[1]=1:
-     ```
-     Frame: [55 01 00 04 00 00 00 02 5D]
-     (Write 0x00000002 to address 0x00 to set WDI_SRC=1)
-     ```
-   - Expected: LED D3 remains OFF (no fault yet)
-
-4. **Send Periodic Software Kicks:**
-   - Send KICK command repeatedly (every 500 ms):
-     ```
-     Frame: [55 03 00 00 56]
-     (CMD=KICK, ADDR=00, LEN=00)
-     ```
-   - Expected: LED D3 stays OFF (watchdog receiving kicks)
-
-5. **Read Status:**
-   - Send GET_STATUS command:
-     ```
-     Frame: [55 04 10 00 14]
-     (CMD=GET_STATUS, ADDR=0x10, LEN=00)
-     ```
-   - Response includes STATUS register bits:
-     - Bit[0]: EN_EFFECTIVE (1 if after arm_delay)
-     - Bit[1]: FAULT_ACTIVE (1 if fault)
-     - Bit[2]: ENOUT (1 if armed)
-     - Bit[3]: WDO (0 if fault)
-     - Bit[4]: LAST_KICK_SRC (0=button, 1=software)
-
-6. **Trigger Timeout:**
-   - Stop sending KICK commands
-   - Wait ~1600 ms
-   - **Expected:** LED D3 turns ON, STATUS[1]=1
-   - Read STATUS to confirm FAULT_ACTIVE=1
-
-7. **Clear Fault Immediately:**
-   - Send WRITE_REG to set CTRL[2]=1:
-     ```
-     Frame: [55 01 00 04 00 00 00 04 59]
-     (Write 0x00000004 to address 0x00 to set CLR_FAULT)
-     ```
-   - **Expected:** LED D3 turns OFF immediately
-   - Watchdog returns to arm_delay safe restart
-
-### Demo Scenario 3: Parameter Modification
-
-This scenario demonstrates runtime reconfiguration of watchdog parameters.
-
-**Procedure:**
-
-1. **Read Current tWD_ms:**
-   - Send READ_REG command:
-     ```
-     Frame: [55 02 04 00 06]
-     ```
-   - Response: Current value (default 1600 ms = 0x00000640)
-
-2. **Modify tWD_ms to 2000 ms:**
-   - Send WRITE_REG command:
-     ```
-     Frame: [55 01 04 04 00 00 07 D0 FC]
-     (Write 0x000007D0 = 2000 to address 0x04)
-     ```
-   - **Result:** Watchdog timeout now 2000 ms instead of 1600 ms
-
-3. **Modify arm_delay_us to 300 µs:**
-   - Send WRITE_REG command:
-     ```
-     Frame: [55 01 0C 02 01 2C DA]
-     (Write 0x012C = 300 to address 0x0C)
-     ```
-   - **Result:** Enable arm_delay now 300 µs
-
-4. **Verify Changes:**
-   - Read registers back via READ_REG to confirm
-
-### Demo Scenario 4: Combined Operation (Hardware + Software)
-
-This scenario mixes hardware button control with UART commands.
-
-**Procedure:**
-
-1. Enable watchdog with S2 button
-2. Set WDI_SRC=0 (hardware button mode) via UART
-3. Send occasional kicks via S1 button
-4. Pause kicks → timeout → LED D3 ON
-5. Send CLR_FAULT via UART → LED D3 OFF
-6. Switch to WDI_SRC=1 (software mode) via UART
-7. Send software kicks via UART instead of button
-8. Verify continuous operation with status polling
-
----
-
-## Testbench Coverage
-
-The provided testbench (`tb_uart_system.v`) covers **5+ core test cases** as required:
-
-### Test Case 1: Normal Kick Operation
-
-**Purpose:** Verify watchdog receives and responds to valid kicks (falling edges).
-
-**Steps:**
-1. Enable watchdog (EN=1)
-2. Wait for arm_delay to expire
-3. Send periodic kicks (button S1 or software KICK command) every 500 ms
-4. Verify LED D3 (WDO) remains OFF throughout
-
-**Expected Results:**
-- WDO stays high (no fault)
-- FaultActive flag remains 0
-- Each kick resets the internal tWD_cnt counter
-
-**Assertion:**
-```verilog
-assert(wdo == 1'b1) else $error("WDO should remain high with valid kicks");
-```
-
-### Test Case 2: Timeout Detection
-
-**Purpose:** Verify watchdog correctly detects timeout when no kick is received.
-
-**Steps:**
-1. Enable watchdog (EN=1)
-2. Wait for arm_delay
-3. Send one kick, then stop kicking
-4. Wait for tWD_ms + buffer time
-5. Monitor WDO transition
-
-**Expected Results:**
-- After tWD_ms (default 1600 ms) without kicks, WDO goes low
-- FaultActive flag = 1
-- WDO stays low for tRST_ms (default 200 ms)
-- After tRST_ms, WDO released and watchdog returns to monitoring
-
-**Assertion:**
-```verilog
-assert(!wdo && FaultActive) else $error("Timeout not detected");
-assert(wdo && !FaultActive) else $error("Fault not released after tRST");
-```
-
-### Test Case 3: Disable Operation
-
-**Purpose:** Verify watchdog safely disables and ignores WDI.
-
-**Steps:**
-1. Enable watchdog (EN=1, LED D4 ON)
-2. Wait for arm_delay
-3. Set EN=0 (button S2 or UART write)
-4. Attempt to send kicks (should be ignored)
-5. Wait for timeout period
-6. Monitor LED D3
-
-**Expected Results:**
-- LED D4 turns OFF immediately (ENOUT=0)
-- LED D3 stays OFF (no timeout detection while disabled)
-- WDI falling edges are completely ignored
-- Watchdog in safe, idle state
-
-**Assertion:**
-```verilog
-assert(!en_o && wdo) else $error("Disabled watchdog should release outputs");
-```
-
-### Test Case 4: Disable-to-Enable Transition with arm_delay
-
-**Purpose:** Verify safe arm_delay window protects against initialization glitches.
-
-**Steps:**
-1. Start with EN=0
-2. Monitor LED D4 (should be OFF)
-3. Set EN=1 (button S2 or UART write)
-4. **Immediately** send WDI kicks (during arm_delay window)
-5. Monitor internal tWD_cnt and FaultActive
-
-**Expected Results:**
-- LED D4 goes OFF briefly (during arm_delay ≈ 150 µs)
-- All WDI kicks during arm_delay are IGNORED (no reset of tWD_cnt)
-- After arm_delay expires, LED D4 turns ON
-- Subsequent kicks now RESET tWD_cnt as normal
-- No false timeouts occur
-
-**Assertion:**
-```verilog
-// After EN=1, WDI signals are ignored for arm_delay_us
-assert(tWD_cnt == 0 || tWD_cnt >= arm_delay_us)
-    else $error("Kick during arm_delay should be ignored");
-```
-
-### Test Case 5: Parameter Changes via UART
-
-**Purpose:** Verify dynamic modification of watchdog parameters.
-
-**Steps:**
-1. Enable watchdog (EN=1)
-2. Read current tWD_ms (default 1600)
-3. Write new tWD_ms = 2000 via UART (WRITE_REG 0x04 with data 0x000007D0)
-4. Read back tWD_ms to confirm
-5. Repeat for other parameters (tRST_ms, arm_delay_us)
-
-**Expected Results:**
-- Parameters are successfully modified via UART
-- Read back confirms new values are stored
-- Watchdog behavior changes accordingly:
-  - Timeout occurs at new tWD_ms value
-  - Fault hold duration = new tRST_ms value
-
-**Assertion:**
-```verilog
-assert(tWD_ms == 32'd2000) 
-    else $error("tWD_ms not updated after WRITE_REG");
-```
-
-### Additional Test Cases (Optional for Extended Coverage)
-
-- **Test Case 6: CLR_FAULT Command** - Verify immediate fault release via UART
-- **Test Case 7: WDI Source Selection** - Verify WDI_SRC bit correctly switches between button and software kicks
-- **Test Case 8: Multiple Timeouts** - Verify watchdog cycles correctly through multiple fault-release sequences
-- **Test Case 9: STATUS Register** - Verify all STATUS bits reflect current watchdog state
-- **Test Case 10: Simultaneous Button + Software Kicks** - Verify both input sources work when multiplexed
-
----
-
-## Scoring Criteria Mapping
-
-This section maps the implementation features to the contest scoring criteria.
-
-### 1. Watchdog Functionality (FSM + Timing) - **50% Weight**
-
-**Requirement Met:**
-
-✅ **Falling Edge Detection:** WDI is correctly sampled on falling edge. The `synchronizer_debounce_fallingedge` module detects falling edges after applying 20 ms debounce filter.
-
-✅ **Timeout Detection:** Watchdog core FSM correctly detects when tWD_ms elapses without a valid kick.
-
-✅ **Fault Generation:** WDO is asserted (pulled low, LED on) for exactly tRST_ms milliseconds when timeout occurs.
-
-✅ **Fault Release:** After tRST_ms, WDO is released to high-Z/pull-up (LED off) and a new cycle begins.
-
-✅ **Enable/Disable Control:** EN signal properly controls watchdog state:
-- EN=0: Watchdog disabled, WDI ignored, ENOUT=0, WDO released
-- EN=1: Watchdog transitions through arm_delay, then to monitoring state (ENOUT=1)
-
-✅ **arm_delay Mechanism:** When watchdog transitions from disabled to enabled, WDI is ignored during arm_delay_us window (default 150 µs) to prevent spurious kicks during initialization.
-
-✅ **Default Parameters:** 
-- tWD_ms = 1600 ms (emulates CWD=NC mode)
-- tRST_ms = 200 ms
-- arm_delay_us = 150 µs
-
-✅ **Open-Drain Emulation:** WDO and ENOUT use push-pull outputs with active-low/active-high conventions as documented.
-
-**Testbench Verification:** Test cases 1-4 directly verify FSM operation and timing.
-
----
-
-### 2. UART + Register Map - **25% Weight**
-
-**Requirement Met:**
-
-✅ **Frame Protocol:** Implements contest-specified frame format `[0x55][CMD][ADDR][LEN][DATA...][CHK]`
-
-✅ **XOR Checksum:** Checksum calculated as `CHK = CMD ⊕ ADDR ⊕ LEN ⊕ DATA[all bytes]`, validated on reception.
-
-✅ **ACK/Response:** Device returns response frame echoing command and providing requested data.
-
-✅ **WRITE_REG (0x01):** Supports writing 32-bit values to configuration registers.
-
-✅ **READ_REG (0x02):** Supports reading 32-bit values from all registers.
-
-✅ **KICK (0x03):** Generates software kick event equivalent to WDI falling edge.
-
-✅ **GET_STATUS (0x04):** Quick STATUS register read command.
-
-✅ **Register Map Completeness:**
-- Address 0x00 (CTRL): R/W 32-bit with EN_SW, WDI_SRC, CLR_FAULT bits
-- Address 0x04 (tWD_ms): R/W 32-bit timeout parameter
-- Address 0x08 (tRST_ms): R/W 32-bit fault hold parameter
-- Address 0x0C (arm_delay_us): R/W 16-bit arm delay parameter
-- Address 0x10 (STATUS): R-only 32-bit status with EN_EFFECTIVE, FAULT_ACTIVE, ENOUT, WDO, LAST_KICK_SRC
-
-✅ **Baud Rate:** UART operates at 115200 bps, 8N1 as specified.
-
-✅ **Stability:** Frame parser correctly handles frame boundaries, resynchronizes on 0x55 marker, ignores incomplete frames.
-
-**Testbench Verification:** Test case 5 verifies parameter modification via UART. Frame parser is thoroughly tested in simulation.
-
----
-
-### 3. Testbench - **15% Weight**
-
-**Requirement Met:**
-
-✅ **5+ Test Cases Implemented:**
-1. Normal kick operation (WDI falling edge resets counter)
-2. Timeout detection (WDO asserted after tWD_ms without kick)
-3. Disable operation (WDI ignored when EN=0)
-4. Disable→Enable transition (arm_delay window protects against glitches)
-5. Parameter changes via UART (dynamic runtime reconfiguration)
-
-✅ **Additional Coverage:**
-- CLR_FAULT command functionality
-- WDI source selection (button vs. software)
-- Multiple fault cycles
-- STATUS register bit verification
-
-✅ **Simulation Features:**
-- Clock generation (27 MHz)
-- UART frame generation with automatic checksum calculation
-- Task-based UART communication (send_byte, send_frame)
-- Timing assertions
-- Message logging for debugging
-
-✅ **Test Results:** Comprehensive verification of all FSM states and transitions.
-
----
-
-### 4. Code & Documentation Quality - **10% Weight**
-
-**Requirement Met:**
-
-✅ **Clean Architecture:** 
-- Modular design with clear separation of concerns
-- Each module has single responsibility (receiver, transmitter, frame parser, watchdog core, etc.)
-- Well-documented module interfaces
-
-✅ **Coding Style:**
-- Consistent parameter naming and conventions
-- Clear signal naming (wdi, en, wdo, enout, tick_us, tick_ms, etc.)
-- Proper use of localparam and parameter for configurability
-- Comments explaining FSM states and timing logic
-
-✅ **README Documentation:**
-- Complete system overview
-- Detailed functional specification (Sections 4.1-4.3 of contest requirements)
-- Implementation details for each module
-- Pin mapping with constraints file reference
-- **LED display convention** (Section 5)
-- **UART protocol with frame examples** (Section 8)
-- **Build instructions** (Section 7)
-- **How to run demo on board** (Section 8)
-- **Testbench coverage** (Section 9)
-- All critical design decisions clearly explained
-
-✅ **Build Automation:**
-- Gowin EDA project structure with `.cst` and `.sdc` files
-- Easy reproduction: clone project, open in Gowin, build and program
-
-✅ **No Ambiguities:**
-- Open-drain emulation approach clearly stated (Option B: push-pull with active-low convention)
-- LED behavior precisely documented
-- UART frame format with real examples
-- Register map with bit descriptions
-
----
-
-## Summary of Key Implementation Decisions
-
-1. **Push-Pull Outputs (Option B):** Chose simplified approach avoiding tri-state complexity, with clear active-low/active-high conventions for LED indication.
-
-2. **27 MHz Base Clock:** Leveraged on-board 27 MHz clock with frequency dividers for microsecond and millisecond precision timing.
-
-3. **20 ms Debounce:** Applied mechanical button debounce to both S1 and S2 inputs to ensure clean edge detection.
-
-4. **Frame-Based UART:** Implemented contest-specified frame protocol with XOR checksum for robust parameter configuration.
-
-5. **Modular RTL Design:** Separated concerns across receiver, transmitter, frame parser, and watchdog core for testability and maintainability.
-
-6. **Register File:** Centralized parameter storage with read/write access, enabling dynamic runtime reconfiguration without recompilation.
-
-7. **arm_delay Safety:** Implemented protected initialization window preventing spurious timeouts during watchdog enable transition.
-
----
-
-## Appendix: Quick Start
-
-1. **Program the board:** Follow build instructions (Section 7)
-2. **Press button S2:** Watchdog enables, LED D4 turns on after ~150 µs
-3. **Press button S1 repeatedly:** Keep kicking, LED D3 stays off
-4. **Stop pressing S1:** Wait ~1600 ms → LED D3 turns on (fault)
-5. **Wait ~200 ms:** LED D3 turns off automatically (fault released)
-6. **For UART testing:** Open serial terminal at 115200 bps, send frame commands
-
----
-
-## References
-
-- TPS3431 Watchdog Timer Datasheet (Texas Instruments, Rev Oct 2021)
-- Kiwi 1P5 FPGA Board - Quick Start Guide (OneKiwi/Gowin)
-- Gowin EDA Documentation (https://www.gowinsemi.com/)
-- Gowin GW1N-1P5 Device Datasheet
-
----
